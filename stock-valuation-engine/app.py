@@ -766,26 +766,34 @@ if not df.empty:
     if "growth_gap" in df.columns and df["growth_gap"].notna().any():
         avg_gap = df["growth_gap"].dropna().mean() * 100
 
-    st.markdown(
-        f"""
-        <div class="summary-row">
-            <div class="summary-card"><div class="label">Tickers</div><div class="value">{len(df)}</div></div>
+    if not df.empty:
+    if "expectations_classification" in df.columns:
+        n_manageable = int((df["expectations_classification"] == "Forward Expectations Manageable").sum())
+        n_elevated = int((df["expectations_classification"] == "Forward Expectations Elevated").sum())
+        n_stretched = int((df["expectations_classification"] == "Forward Expectations Stretched").sum())
+    else:
+        n_manageable = n_elevated = n_stretched = 0
 
-            <div class="summary-card"><div class="label">Avg growth gap</div>
-                <div class="value">{f'{avg_gap:+.1f}%' if avg_gap is not None else 'n/a'}</div></div>
+    avg_gap = None
+    if "growth_gap" in df.columns and df["growth_gap"].notna().any():
+        avg_gap = df["growth_gap"].dropna().mean() * 100
 
-            <div class="summary-card"><div class="label" style="color:{STATUS_COLORS['Forward Expectations Manageable']}">Manageable</div>
-                <div class="value">{n_manageable}</div></div>
+    avg_gap_text = f"{avg_gap:+.1f}%" if avg_gap is not None else "n/a"
 
-            <div class="summary-card"><div class="label" style="color:{STATUS_COLORS['Forward Expectations Elevated']}">Elevated</div>
-                <div class="value">{n_elevated}</div></div>
-
-            <div class="summary-card"><div class="label" style="color:{STATUS_COLORS['Forward Expectations Stretched']}">Stretched</div>
-                <div class="value">{n_stretched}</div></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    # IMPORTANT: one continuous HTML string -- NO blank lines, NO indentation.
+    # A blank line ends the HTML block; indented lines after it are shown
+    # as literal code text by Streamlit's markdown parser.
+    summary_html = (
+        '<div class="summary-row">'
+        f'<div class="summary-card"><div class="label">Tickers</div><div class="value">{len(df)}</div></div>'
+        f'<div class="summary-card"><div class="label">Avg growth gap</div><div class="value">{avg_gap_text}</div></div>'
+        f'<div class="summary-card"><div class="label" style="color:{STATUS_COLORS["Forward Expectations Manageable"]}">Manageable</div><div class="value">{n_manageable}</div></div>'
+        f'<div class="summary-card"><div class="label" style="color:{STATUS_COLORS["Forward Expectations Elevated"]}">Elevated</div><div class="value">{n_elevated}</div></div>'
+        f'<div class="summary-card"><div class="label" style="color:{STATUS_COLORS["Forward Expectations Stretched"]}">Stretched</div><div class="value">{n_stretched}</div></div>'
+        '</div>'
     )
+
+    st.markdown(summary_html, unsafe_allow_html=True)
 
 
 tab_overview, tab_detail, tab_search = st.tabs(["Watchlist", "Ticker detail", "Ad-hoc search"])
