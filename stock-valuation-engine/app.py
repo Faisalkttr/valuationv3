@@ -1,21 +1,7 @@
 """
 Streamlit dashboard for the valuation engine.
-
-Reads data/latest.csv (written by engine/run.py) -- no live network calls
-here except the Ad-hoc search tab, which does a live fetch on demand.
-
-This version is defensive:
-- every value is read with .get() + safe formatters (missing -> "n/a")
-- fetch_adhoc() inspects compute_valuation()'s signature and only passes
-  kwargs that exist, so it works with both the original engine files and
-  the extended engine files (owner earnings / anti-bubble / cadence)
-- all st.markdown HTML blocks are single continuous strings (no blank
-  lines, no indentation) so Streamlit never renders raw HTML as code
-
-Run locally with:  streamlit run app.py
 """
 
-import inspect
 import sqlite3
 from pathlib import Path
 
@@ -89,10 +75,6 @@ def anti_bubble_color(flag: str) -> str:
     return "#8B949E"
 
 
-# ---------------------------------------------------------------------------
-# Safe formatting helpers
-# ---------------------------------------------------------------------------
-
 def safe_float(value):
     try:
         if value is None or pd.isna(value):
@@ -142,23 +124,27 @@ def fmt_large_amount(value) -> str:
     return f"${v:,.0f}"
 
 
-# ---------------------------------------------------------------------------
-# Global CSS (one continuous HTML block -- no blank lines inside)
-# ---------------------------------------------------------------------------
-
 st.markdown(f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
 html, body, [class*="css"] {{
     font-family: 'Inter', sans-serif;
 }}
+
 .stApp {{
     background-color: {BG};
 }}
+
 h1, h2, h3 {{
     font-family: 'Space Grotesk', sans-serif !important;
     letter-spacing: -0.01em;
 }}
+
+[data-testid="stMetricValue"], .mono {{
+    font-family: 'IBM Plex Mono', monospace !important;
+}}
+
 .terminal-header {{
     display: flex;
     align-items: baseline;
@@ -167,6 +153,7 @@ h1, h2, h3 {{
     padding-bottom: 14px;
     margin-bottom: 6px;
 }}
+
 .terminal-title {{
     font-family: 'Space Grotesk', sans-serif;
     font-size: 1.7rem;
@@ -174,17 +161,20 @@ h1, h2, h3 {{
     color: {TEXT};
     margin: 0;
 }}
+
 .terminal-sub {{
     color: {TEXT_MUTED};
     font-size: 0.85rem;
     font-family: 'IBM Plex Mono', monospace;
 }}
+
 .summary-row {{
     display: flex;
     gap: 10px;
     margin: 18px 0 22px 0;
     flex-wrap: wrap;
 }}
+
 .summary-card {{
     background: {SURFACE};
     border: 1px solid {BORDER};
@@ -193,6 +183,7 @@ h1, h2, h3 {{
     flex: 1;
     min-width: 140px;
 }}
+
 .summary-card .label {{
     color: {TEXT_MUTED};
     font-size: 0.72rem;
@@ -200,18 +191,21 @@ h1, h2, h3 {{
     letter-spacing: 0.06em;
     margin-bottom: 4px;
 }}
+
 .summary-card .value {{
     font-family: 'IBM Plex Mono', monospace;
     font-size: 1.4rem;
     font-weight: 600;
     color: {TEXT};
 }}
+
 .chip-row {{
     display: flex;
     gap: 8px;
     flex-wrap: wrap;
     margin-bottom: 16px;
 }}
+
 .chip {{
     display: inline-flex;
     align-items: center;
@@ -223,12 +217,36 @@ h1, h2, h3 {{
     font-size: 0.78rem;
     color: {TEXT};
 }}
+
 .chip .dot {{
     width: 8px;
     height: 8px;
     border-radius: 50%;
     display: inline-block;
 }}
+
+.section-card {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-left: 4px solid var(--accent);
+    border-radius: 10px;
+    padding: 14px 18px;
+    margin-bottom: 10px;
+}}
+
+.section-card .sc-title {{
+    font-family: 'Space Grotesk', sans-serif;
+    font-weight: 600;
+    font-size: 1.05rem;
+    color: {TEXT};
+    margin-bottom: 2px;
+}}
+
+.section-card .sc-sub {{
+    color: {TEXT_MUTED};
+    font-size: 0.8rem;
+}}
+
 .detail-card {{
     background: {SURFACE};
     border: 1px solid {BORDER};
@@ -237,6 +255,7 @@ h1, h2, h3 {{
     padding: 14px 16px;
     height: 100%;
 }}
+
 .detail-card .dc-label {{
     color: {TEXT_MUTED};
     font-size: 0.72rem;
@@ -244,12 +263,14 @@ h1, h2, h3 {{
     letter-spacing: 0.05em;
     margin-bottom: 6px;
 }}
+
 .detail-card .dc-value {{
     font-family: 'IBM Plex Mono', monospace;
     font-size: 1.5rem;
     font-weight: 600;
     color: {TEXT};
 }}
+
 .badge {{
     display: inline-block;
     padding: 3px 10px;
@@ -257,6 +278,7 @@ h1, h2, h3 {{
     font-size: 0.78rem;
     font-weight: 500;
 }}
+
 [data-testid="stDataFrame"] {{
     border: 1px solid {BORDER};
     border-radius: 8px;
@@ -265,14 +287,11 @@ h1, h2, h3 {{
 """, unsafe_allow_html=True)
 
 
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
-
 @st.cache_data(ttl=3600)
 def load_latest() -> pd.DataFrame:
     if not LATEST_CSV.exists():
         return pd.DataFrame()
+
     return pd.read_csv(LATEST_CSV)
 
 
@@ -282,52 +301,49 @@ def load_history(ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     with sqlite3.connect(HISTORY_DB) as conn:
-        hist = pd.read_sql(
+        df = pd.read_sql(
             "SELECT * FROM valuation_snapshots WHERE ticker = ? ORDER BY as_of",
             conn,
             params=(ticker,),
         )
 
-    if not hist.empty:
-        hist["as_of"] = pd.to_datetime(hist["as_of"])
+    if not df.empty:
+        df["as_of"] = pd.to_datetime(df["as_of"])
 
-    return hist
+    return df
 
-
-# ---------------------------------------------------------------------------
-# Ticker detail renderer
-# ---------------------------------------------------------------------------
 
 def render_ticker_detail(row, show_trend: bool = True):
+    """
+    Renders the full ticker breakdown.
+    Works for both stored rows and ad-hoc dictionary results.
+    """
     ticker = row.get("ticker", "Unknown")
+    accent = section_color(row.get("section", "")) if pd.notna(row.get("section")) else DEFAULT_ACCENT
 
-    section_val = row.get("section")
-    accent = section_color(section_val) if pd.notna(section_val) else DEFAULT_ACCENT
+    header_bits = [ticker]
 
-    header_bits = [str(ticker)]
-
-    if pd.notna(section_val):
-        header_bits.append(f"{section_val} · {row.get('layer', '')}")
+    if pd.notna(row.get("section")):
+        header_bits.append(f"{row['section']} · {row.get('layer', '')}")
 
     st.markdown(
         f'<div style="color:{TEXT_MUTED};font-size:0.85rem;margin-bottom:10px;">{" · ".join(header_bits)}</div>',
         unsafe_allow_html=True,
     )
 
-    if (
-        row.get("currency_note")
-        and pd.isna(row.get("fx_rate_applied"))
-        and pd.notna(row.get("revenue_currency"))
-    ):
+    if row.get("currency_note") and pd.isna(row.get("fx_rate_applied")) and pd.notna(row.get("revenue_currency")):
         st.warning(f"⚠ {row['currency_note']}")
 
     def card(col, label, value, color=None):
         color = color or accent
+
         col.markdown(
-            f'<div class="detail-card" style="--accent:{color}">'
-            f'<div class="dc-label">{label}</div>'
-            f'<div class="dc-value">{value}</div>'
-            '</div>',
+            f"""
+            <div class="detail-card" style="--accent:{color}">
+                <div class="dc-label">{label}</div>
+                <div class="dc-value">{value}</div>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
 
@@ -342,23 +358,14 @@ def render_ticker_detail(row, show_trend: bool = True):
     card(c2, "Historical median", fmt_multiple(row.get("hist_median_ps")))
     card(c3, "Forward P/S", fmt_multiple(row.get("forward_ps")))
 
-    classification = row.get("expectations_classification")
-    if classification is None or pd.isna(classification):
-        classification = "Insufficient data"
+    classification = row.get("expectations_classification", "Insufficient data")
 
     card(
         c4,
         "Expectations",
-        str(classification).replace("Forward Expectations ", ""),
+        classification.replace("Forward Expectations ", ""),
         color=status_color(classification),
     )
-
-    cadence = row.get("revenue_data_cadence")
-    if cadence is not None and str(cadence).strip().lower() not in ("", "quarterly"):
-        st.caption(
-            f"Revenue reporting cadence: {cadence} -- TTM figures are approximated "
-            f"from the latest reported periods (common for semiannual/annual reporters)."
-        )
 
     if row.get("plain_explanation"):
         st.markdown(
@@ -400,7 +407,7 @@ def render_ticker_detail(row, show_trend: bool = True):
     st.plotly_chart(fig, use_container_width=True)
 
     if show_trend:
-        hist = load_history(str(ticker))
+        hist = load_history(ticker)
 
         if len(hist) > 1:
             st.markdown("##### P/S over time")
@@ -426,11 +433,9 @@ def render_ticker_detail(row, show_trend: bool = True):
             )
 
             st.plotly_chart(line, use_container_width=True)
+
     else:
-        st.caption(
-            "Trend history isn't tracked for ad-hoc lookups -- "
-            "only for tickers in the configured watchlist."
-        )
+        st.caption("Trend history isn't tracked for ad-hoc lookups -- only for tickers in the configured watchlist.")
 
     # -----------------------------------------------------------------
     # Fundamentals overlay
@@ -450,7 +455,7 @@ def render_ticker_detail(row, show_trend: bool = True):
     )
 
     if not has_any_fundamental:
-        st.caption("No fundamentals data available for this ticker (common for some foreign listings).")
+        st.caption("No fundamentals data available for this ticker.")
     else:
         f1, f2, f3, f4 = st.columns(4)
 
@@ -460,7 +465,7 @@ def render_ticker_detail(row, show_trend: bool = True):
         card(f4, "FCF margin", fmt_pct(row.get("fcf_margin")))
 
     # -----------------------------------------------------------------
-    # Owner earnings overlay (only shown when the engine provides it)
+    # Owner earnings overlay
     # -----------------------------------------------------------------
     owner_yield = safe_float(row.get("owner_earnings_yield"))
 
@@ -476,13 +481,32 @@ def render_ticker_detail(row, show_trend: bool = True):
 
     if any(
         pd.notna(row.get(f))
-        for f in ["owner_earnings_yield", "owner_earnings_ttm", "maintenance_capex_ttm"]
+        for f in [
+            "owner_earnings_yield",
+            "owner_earnings_ttm",
+            "maintenance_capex_ttm",
+        ]
     ):
         oe1, oe2, oe3 = st.columns(3)
 
-        card(oe1, "Owner earnings yield", fmt_pct(owner_yield), color=owner_yield_color)
-        card(oe2, "Owner earnings (TTM)", fmt_large_amount(row.get("owner_earnings_ttm")))
-        card(oe3, "Maintenance capex (TTM)", fmt_large_amount(row.get("maintenance_capex_ttm")))
+        card(
+            oe1,
+            "Owner earnings yield",
+            fmt_pct(owner_yield),
+            color=owner_yield_color,
+        )
+
+        card(
+            oe2,
+            "Owner earnings (TTM)",
+            fmt_large_amount(row.get("owner_earnings_ttm")),
+        )
+
+        card(
+            oe3,
+            "Maintenance capex (TTM)",
+            fmt_large_amount(row.get("maintenance_capex_ttm")),
+        )
 
         if row.get("owner_earnings_method"):
             st.caption(f"Owner earnings method: {row['owner_earnings_method']}")
@@ -499,9 +523,7 @@ def render_ticker_detail(row, show_trend: bool = True):
         )
 
         st.caption(
-            "Fundamentals read: flags unprofitability (operating margin < 0), high leverage "
-            "(net debt/EBITDA > 3x), or negative free cash flow -- context for whether the "
-            "growth story above is backed by a healthy business, not a replacement for it."
+            "Fundamentals read: flags unprofitability, high leverage, or negative free cash flow."
         )
 
     # -----------------------------------------------------------------
@@ -518,8 +540,7 @@ def render_ticker_detail(row, show_trend: bool = True):
         card(d2, "Revenue CAGR (5Y)", fmt_pct(row.get("revenue_cagr_5y")))
 
         st.caption(
-            "Compare this to the forward growth estimate above -- if the forecast is far above "
-            "the historical CAGR, that's a bigger ask than the growth gap alone suggests."
+            "Compare this to the forward growth estimate above."
         )
 
     # -----------------------------------------------------------------
@@ -529,7 +550,13 @@ def render_ticker_detail(row, show_trend: bool = True):
 
     has_mgmt = any(
         pd.notna(row.get(f))
-        for f in ["roic", "share_count_cagr_3y", "buybacks_ttm", "dividends_ttm", "acquisitions_ttm"]
+        for f in [
+            "roic",
+            "share_count_cagr_3y",
+            "buybacks_ttm",
+            "dividends_ttm",
+            "acquisitions_ttm",
+        ]
     )
 
     if not has_mgmt:
@@ -557,15 +584,14 @@ def render_ticker_detail(row, show_trend: bool = True):
             ("M&A", "acquisitions_ttm"),
         ]:
             val = safe_float(row.get(key))
+
             if val is not None and val:
-                allocation_parts.append(f"{label} {fmt_large_amount(val)}")
+                allocation_parts.append(f"{label} ${val / 1e6:,.0f}M")
 
         card(m3, "Capital deployed (TTM)", " · ".join(allocation_parts) if allocation_parts else "n/a")
 
         st.caption(
-            "Share count CAGR: negative = net buybacks shrinking the share count, positive = "
-            "dilution. Capital deployed is descriptive only -- it shows the split, not a grade "
-            "of whether it was spent well."
+            "Share count CAGR: negative = net buybacks, positive = dilution."
         )
 
     # -----------------------------------------------------------------
@@ -593,26 +619,19 @@ def render_ticker_detail(row, show_trend: bool = True):
 
         card(k2, f"Vs. {bm} (6M)", fmt_signed_pp(rel), color=rel_color)
 
-        up = safe_float(row.get("eps_revisions_up_30d"))
-        down = safe_float(row.get("eps_revisions_down_30d"))
+        up, down = row.get("eps_revisions_up_30d"), row.get("eps_revisions_down_30d")
 
-        if up is not None or down is not None:
-            card(
-                k3,
-                "EPS revisions (30D)",
-                f"↑{int(up) if up is not None else 0} / ↓{int(down) if down is not None else 0}",
-            )
+        if pd.notna(up) or pd.notna(down):
+            card(k3, "EPS revisions (30D)", f"↑{int(up) if pd.notna(up) else 0} / ↓{int(down) if pd.notna(down) else 0}")
         else:
             card(k3, "EPS revisions (30D)", "n/a")
 
         st.caption(
-            "Relative strength compares 6-month price return to a region-appropriate index -- "
-            "positive means the stock has outperformed its market, not an absolute judgment of "
-            "quality. Estimate revision coverage is patchy outside large, well-covered names."
+            "Relative strength compares 6-month price return to a region-appropriate index."
         )
 
     # -----------------------------------------------------------------
-    # Anti-bubble detector (only shown when the engine provides it)
+    # Anti-bubble detector
     # -----------------------------------------------------------------
     st.markdown("##### Anti-bubble detector")
 
@@ -635,6 +654,7 @@ def render_ticker_detail(row, show_trend: bool = True):
                 gap_color = "#E0A63A"
             else:
                 gap_color = "#E0584F"
+
             gap_text = f"{gap * 100:+.1f}pp"
         else:
             gap_color = DEFAULT_ACCENT
@@ -643,29 +663,30 @@ def render_ticker_detail(row, show_trend: bool = True):
         card(b3, "Multiple expansion gap", gap_text, color=gap_color)
 
         bubble_flag = row.get("anti_bubble_flag", "Insufficient data")
-        if bubble_flag is None or pd.isna(bubble_flag):
-            bubble_flag = "Insufficient data"
 
-        card(b4, "Bubble read", bubble_flag, color=anti_bubble_color(bubble_flag))
+        card(
+            b4,
+            "Bubble read",
+            bubble_flag,
+            color=anti_bubble_color(bubble_flag),
+        )
 
         if row.get("anti_bubble_note"):
             st.caption(row["anti_bubble_note"])
         else:
             st.caption(
-                "Gap = 3-year market cap growth minus 3-year revenue growth. "
-                "Positive values mean multiple expansion."
+                "Gap = 3-year market cap growth minus 3-year revenue growth."
             )
 
 
-# ---------------------------------------------------------------------------
-# Ad-hoc live fetch (adaptive to whichever engine version is installed)
-# ---------------------------------------------------------------------------
-
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_adhoc(symbol: str, history_years: int = 5) -> dict:
+    """
+    Live fetch + compute for a ticker outside the configured watchlist.
+    """
     raw = fetch_ticker(symbol, history_years=history_years)
 
-    candidate_kwargs = dict(
+    result = compute_valuation(
         ticker=symbol,
         current_revenue_ttm=raw.current_revenue_ttm,
         current_market_cap=raw.current_market_cap,
@@ -697,35 +718,26 @@ def fetch_adhoc(symbol: str, history_years: int = 5) -> dict:
         relative_strength_6m=raw.relative_strength_6m,
         eps_revisions_up_30d=raw.eps_revisions_up_30d,
         eps_revisions_down_30d=raw.eps_revisions_down_30d,
-        owner_earnings_ttm=getattr(raw, "owner_earnings_ttm", None),
-        owner_earnings_yield=getattr(raw, "owner_earnings_yield", None),
-        maintenance_capex_ttm=getattr(raw, "maintenance_capex_ttm", None),
-        owner_earnings_method=getattr(raw, "owner_earnings_method", None),
-        price_cagr_3y=getattr(raw, "price_cagr_3y", None),
-        market_cap_cagr_3y=getattr(raw, "market_cap_cagr_3y", None),
+        owner_earnings_ttm=raw.owner_earnings_ttm,
+        owner_earnings_yield=raw.owner_earnings_yield,
+        maintenance_capex_ttm=raw.maintenance_capex_ttm,
+        owner_earnings_method=raw.owner_earnings_method,
+        price_cagr_3y=raw.price_cagr_3y,
+        market_cap_cagr_3y=raw.market_cap_cagr_3y,
     )
-
-    sig = inspect.signature(compute_valuation)
-    kwargs = {k: v for k, v in candidate_kwargs.items() if k in sig.parameters}
-
-    result = compute_valuation(**kwargs)
 
     return result.to_dict()
 
 
-# ---------------------------------------------------------------------------
-# Header
-# ---------------------------------------------------------------------------
-
 df = load_latest()
 
-last_refreshed = df["as_of"].max() if not df.empty else "—"
-
 st.markdown(
-    '<div class="terminal-header">'
-    '<div class="terminal-title">Valuation Terminal</div>'
-    f'<div class="terminal-sub">{len(df)} tickers tracked · last refreshed {last_refreshed}</div>'
-    '</div>',
+    f"""
+    <div class="terminal-header">
+        <div class="terminal-title">Valuation Terminal</div>
+        <div class="terminal-sub">{len(df)} tickers tracked · last refreshed {df['as_of'].max() if not df.empty else '—'}</div>
+    </div>
+    """,
     unsafe_allow_html=True,
 )
 
@@ -738,35 +750,38 @@ if df.empty:
 
 
 # ---------------------------------------------------------------------------
-# Summary strip -- ONE continuous HTML string (no blank lines, no indentation)
+# Summary strip
 # ---------------------------------------------------------------------------
 
 if not df.empty:
     if "expectations_classification" in df.columns:
-        n_manageable = int((df["expectations_classification"] == "Forward Expectations Manageable").sum())
-        n_elevated = int((df["expectations_classification"] == "Forward Expectations Elevated").sum())
-        n_stretched = int((df["expectations_classification"] == "Forward Expectations Stretched").sum())
+        n_manageable = (df["expectations_classification"] == "Forward Expectations Manageable").sum()
+        n_elevated = (df["expectations_classification"] == "Forward Expectations Elevated").sum()
+        n_stretched = (df["expectations_classification"] == "Forward Expectations Stretched").sum()
     else:
         n_manageable = n_elevated = n_stretched = 0
 
     avg_gap = None
 
     if "growth_gap" in df.columns and df["growth_gap"].notna().any():
-        avg_gap = df["growth_gap"].dropna().clip(-1.0, 3.0).mean() * 100
+        avg_gap = df["growth_gap"].dropna().mean() * 100
 
-    avg_gap_text = f"{avg_gap:+.1f}%" if avg_gap is not None else "n/a"
-
-    summary_html = (
-        '<div class="summary-row">'
-        f'<div class="summary-card"><div class="label">Tickers</div><div class="value">{len(df)}</div></div>'
-        f'<div class="summary-card"><div class="label">Avg growth gap</div><div class="value">{avg_gap_text}</div></div>'
-        f'<div class="summary-card"><div class="label" style="color:{STATUS_COLORS["Forward Expectations Manageable"]}">Manageable</div><div class="value">{n_manageable}</div></div>'
-        f'<div class="summary-card"><div class="label" style="color:{STATUS_COLORS["Forward Expectations Elevated"]}">Elevated</div><div class="value">{n_elevated}</div></div>'
-        f'<div class="summary-card"><div class="label" style="color:{STATUS_COLORS["Forward Expectations Stretched"]}">Stretched</div><div class="value">{n_stretched}</div></div>'
-        '</div>'
+    st.markdown(
+        f"""
+        <div class="summary-row">
+            <div class="summary-card"><div class="label">Tickers</div><div class="value">{len(df)}</div></div>
+            <div class="summary-card"><div class="label">Avg growth gap</div>
+                <div class="value">{f'{avg_gap:+.1f}%' if avg_gap is not None else 'n/a'}</div></div>
+            <div class="summary-card"><div class="label" style="color:{STATUS_COLORS['Forward Expectations Manageable']}">Manageable</div>
+                <div class="value">{n_manageable}</div></div>
+            <div class="summary-card"><div class="label" style="color:{STATUS_COLORS['Forward Expectations Elevated']}">Elevated</div>
+                <div class="value">{n_elevated}</div></div>
+            <div class="summary-card"><div class="label" style="color:{STATUS_COLORS['Forward Expectations Stretched']}">Stretched</div>
+                <div class="value">{n_stretched}</div></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
-
-    st.markdown(summary_html, unsafe_allow_html=True)
 
 
 tab_overview, tab_detail, tab_search = st.tabs(["Watchlist", "Ticker detail", "Ad-hoc search"])
@@ -856,11 +871,7 @@ def render_watchlist_tab():
     }
 
     if "Target wt %" in view.columns:
-        max_wt = (
-            float(view["Target wt %"].max())
-            if not view.empty and pd.notna(view["Target wt %"].max())
-            else 1.0
-        )
+        max_wt = float(view["Target wt %"].max()) if not view.empty and pd.notna(view["Target wt %"].max()) else 1.0
 
         column_config["Target wt %"] = st.column_config.ProgressColumn(
             format="%.2f%%",
@@ -896,7 +907,7 @@ with tab_detail:
 with tab_search:
     st.caption(
         "Look up any ticker outside your configured watchlist -- runs a live fetch "
-        "against Yahoo Finance (takes a few seconds), separate from the tracked data above."
+        "against Yahoo Finance, separate from the tracked data above."
     )
 
     col_a, col_b = st.columns([4, 1])
