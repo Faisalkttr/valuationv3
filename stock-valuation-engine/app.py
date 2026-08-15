@@ -1,15 +1,21 @@
 """
 Streamlit dashboard for the valuation engine.
 
-Reads data/latest.csv (written by engine/run.py, refreshed daily by
-GitHub Actions) -- no live network calls happen here, so the dashboard
-loads instantly even with 100+ tickers.
+Reads data/latest.csv (written by engine/run.py) -- no live network calls
+here except the Ad-hoc search tab, which does a live fetch on demand.
 
-The Ad-hoc search tab is the only place that performs a live fetch.
+This version is defensive:
+- every value is read with .get() + safe formatters (missing -> "n/a")
+- fetch_adhoc() inspects compute_valuation()'s signature and only passes
+  kwargs that exist, so it works with both the original engine files and
+  the extended engine files (owner earnings / anti-bubble / cadence)
+- all st.markdown HTML blocks are single continuous strings (no blank
+  lines, no indentation) so Streamlit never renders raw HTML as code
 
 Run locally with:  streamlit run app.py
 """
 
+import inspect
 import sqlite3
 from pathlib import Path
 
@@ -84,7 +90,7 @@ def anti_bubble_color(flag: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Safe formatting helpers -- the dashboard must never crash on NaN/missing
+# Safe formatting helpers
 # ---------------------------------------------------------------------------
 
 def safe_float(value):
@@ -137,7 +143,7 @@ def fmt_large_amount(value) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Global CSS
+# Global CSS (one continuous HTML block -- no blank lines inside)
 # ---------------------------------------------------------------------------
 
 st.markdown(f"""
@@ -152,9 +158,6 @@ html, body, [class*="css"] {{
 h1, h2, h3 {{
     font-family: 'Space Grotesk', sans-serif !important;
     letter-spacing: -0.01em;
-}}
-[data-testid="stMetricValue"], .mono {{
-    font-family: 'IBM Plex Mono', monospace !important;
 }}
 .terminal-header {{
     display: flex;
@@ -279,16 +282,16 @@ def load_history(ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     with sqlite3.connect(HISTORY_DB) as conn:
-        df = pd.read_sql(
+        hist = pd.read_sql(
             "SELECT * FROM valuation_snapshots WHERE ticker = ? ORDER BY as_of",
             conn,
             params=(ticker,),
         )
 
-    if not df.empty:
-        df["as_of"] = pd.to_datetime(df["as_of"])
+    if not hist.empty:
+        hist["as_of"] = pd.to_datetime(hist["as_of"])
 
-    return df
+    return hist
 
 
 # ---------------------------------------------------------------------------
@@ -296,13 +299,6 @@ def load_history(ticker: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def render_ticker_detail(row, show_trend: bool = True):
-    """
-    Renders the full ticker breakdown.
-
-    Works for both stored rows (pandas Series from data/latest.csv) and
-    ad-hoc results (plain dict from ValuationResult.to_dict()).
-    All fields are read defensively so missing/NaN values show "n/a".
-    """
     ticker = row.get("ticker", "Unknown")
 
     section_val = row.get("section")
@@ -318,7 +314,6 @@ def render_ticker_detail(row, show_trend: bool = True):
         unsafe_allow_html=True,
     )
 
-    # Currency warning first -- it undermines every number below it.
     if (
         row.get("currency_note")
         and pd.isna(row.get("fx_rate_applied"))
@@ -433,7 +428,8 @@ def render_ticker_detail(row, show_trend: bool = True):
             st.plotly_chart(line, use_container_width=True)
     else:
         st.caption(
-            "Trend history isn't tracked for ad-hoc lookups -- only for tickers in the configured watchlist."
+            "Trend history isn't tracked for ad-hoc lookups -- "
+            "only for tickers in the configured watchlist."
         )
 
     # -----------------------------------------------------------------
@@ -464,7 +460,7 @@ def render_ticker_detail(row, show_trend: bool = True):
         card(f4, "FCF margin", fmt_pct(row.get("fcf_margin")))
 
     # -----------------------------------------------------------------
-    # Owner earnings overlay
+    # Owner earnings overlay (only shown when the engine provides it)
     # -----------------------------------------------------------------
     owner_yield = safe_float(row.get("owner_earnings_yield"))
 
@@ -555,7 +551,11 @@ def render_ticker_detail(row, show_trend: bool = True):
 
         allocation_parts = []
 
-        for label, key in [("Buybacks", "buybacks_ttm"), ("Dividends", "dividends_ttm"), ("M&A", "acquisitions_ttm")]:
+        for label, key in [
+            ("Buybacks", "buybacks_ttm"),
+            ("Dividends", "dividends_ttm"),
+            ("M&A", "acquisitions_ttm"),
+        ]:
             val = safe_float(row.get(key))
             if val is not None and val:
                 allocation_parts.append(f"{label} {fmt_large_amount(val)}")
@@ -611,8 +611,8 @@ def render_ticker_detail(row, show_trend: bool = True):
             "quality. Estimate revision coverage is patchy outside large, well-covered names."
         )
 
-        # -----------------------------------------------------------------
-    # Anti-bubble detector
+    # -----------------------------------------------------------------
+    # Anti-bubble detector (only shown when the engine provides it)
     # -----------------------------------------------------------------
     st.markdown("##### Anti-bubble detector")
 
@@ -655,3 +655,276 @@ def render_ticker_detail(row, show_trend: bool = True):
                 "Gap = 3-year market cap growth minus 3-year revenue growth. "
                 "Positive values mean multiple expansion."
             )
+
+
+# ---------------------------------------------------------------------------
+# Ad-hoc live fetch (adaptive to whichever engine version is installed)
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_adhoc(symbol: str, history_years: int = 5) -> dict:
+    raw = fetch_ticker(symbol, history_years=history_years)
+
+    candidate_kwargs = dict(
+        ticker=symbol,
+        current_revenue_ttm=raw.current_revenue_ttm,
+        current_market_cap=raw.current_market_cap,
+        historical_ps_series=raw.historical_ps_series,
+        forward_revenue_estimate=raw.forward_revenue_estimate,
+        revenue_cadence=raw.revenue_cadence,
+        gross_margin=raw.gross_margin,
+        operating_margin=raw.operating_margin,
+        net_margin=raw.net_margin,
+        net_debt_to_ebitda=raw.net_debt_to_ebitda,
+        interest_coverage=raw.interest_coverage,
+        free_cash_flow_ttm=raw.free_cash_flow_ttm,
+        fcf_margin=raw.fcf_margin,
+        cash_conversion=raw.cash_conversion,
+        revenue_currency=raw.revenue_currency,
+        price_currency=raw.price_currency,
+        fx_rate_applied=raw.fx_rate_applied,
+        currency_note=raw.currency_note,
+        revenue_cagr_3y=raw.revenue_cagr_3y,
+        revenue_cagr_5y=raw.revenue_cagr_5y,
+        roic=raw.roic,
+        share_count_cagr_3y=raw.share_count_cagr_3y,
+        buybacks_ttm=raw.buybacks_ttm,
+        dividends_ttm=raw.dividends_ttm,
+        acquisitions_ttm=raw.acquisitions_ttm,
+        price_return_6m=raw.price_return_6m,
+        benchmark_symbol=raw.benchmark_symbol,
+        benchmark_return_6m=raw.benchmark_return_6m,
+        relative_strength_6m=raw.relative_strength_6m,
+        eps_revisions_up_30d=raw.eps_revisions_up_30d,
+        eps_revisions_down_30d=raw.eps_revisions_down_30d,
+        owner_earnings_ttm=getattr(raw, "owner_earnings_ttm", None),
+        owner_earnings_yield=getattr(raw, "owner_earnings_yield", None),
+        maintenance_capex_ttm=getattr(raw, "maintenance_capex_ttm", None),
+        owner_earnings_method=getattr(raw, "owner_earnings_method", None),
+        price_cagr_3y=getattr(raw, "price_cagr_3y", None),
+        market_cap_cagr_3y=getattr(raw, "market_cap_cagr_3y", None),
+    )
+
+    sig = inspect.signature(compute_valuation)
+    kwargs = {k: v for k, v in candidate_kwargs.items() if k in sig.parameters}
+
+    result = compute_valuation(**kwargs)
+
+    return result.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+
+df = load_latest()
+
+last_refreshed = df["as_of"].max() if not df.empty else "—"
+
+st.markdown(
+    '<div class="terminal-header">'
+    '<div class="terminal-title">Valuation Terminal</div>'
+    f'<div class="terminal-sub">{len(df)} tickers tracked · last refreshed {last_refreshed}</div>'
+    '</div>',
+    unsafe_allow_html=True,
+)
+
+if df.empty:
+    st.info(
+        "No watchlist data yet. Run `python -m engine.run` locally, or trigger the "
+        "'Refresh valuation data' workflow from the GitHub Actions tab. The Ad-hoc "
+        "search tab below works regardless."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Summary strip -- ONE continuous HTML string (no blank lines, no indentation)
+# ---------------------------------------------------------------------------
+
+if not df.empty:
+    if "expectations_classification" in df.columns:
+        n_manageable = int((df["expectations_classification"] == "Forward Expectations Manageable").sum())
+        n_elevated = int((df["expectations_classification"] == "Forward Expectations Elevated").sum())
+        n_stretched = int((df["expectations_classification"] == "Forward Expectations Stretched").sum())
+    else:
+        n_manageable = n_elevated = n_stretched = 0
+
+    avg_gap = None
+
+    if "growth_gap" in df.columns and df["growth_gap"].notna().any():
+        avg_gap = df["growth_gap"].dropna().clip(-1.0, 3.0).mean() * 100
+
+    avg_gap_text = f"{avg_gap:+.1f}%" if avg_gap is not None else "n/a"
+
+    summary_html = (
+        '<div class="summary-row">'
+        f'<div class="summary-card"><div class="label">Tickers</div><div class="value">{len(df)}</div></div>'
+        f'<div class="summary-card"><div class="label">Avg growth gap</div><div class="value">{avg_gap_text}</div></div>'
+        f'<div class="summary-card"><div class="label" style="color:{STATUS_COLORS["Forward Expectations Manageable"]}">Manageable</div><div class="value">{n_manageable}</div></div>'
+        f'<div class="summary-card"><div class="label" style="color:{STATUS_COLORS["Forward Expectations Elevated"]}">Elevated</div><div class="value">{n_elevated}</div></div>'
+        f'<div class="summary-card"><div class="label" style="color:{STATUS_COLORS["Forward Expectations Stretched"]}">Stretched</div><div class="value">{n_stretched}</div></div>'
+        '</div>'
+    )
+
+    st.markdown(summary_html, unsafe_allow_html=True)
+
+
+tab_overview, tab_detail, tab_search = st.tabs(["Watchlist", "Ticker detail", "Ad-hoc search"])
+
+
+# ---------------------------------------------------------------------------
+# Watchlist tab
+# ---------------------------------------------------------------------------
+
+def render_watchlist_tab():
+    if df.empty:
+        st.caption("Nothing to show yet -- run the engine to populate the watchlist.")
+        return
+
+    has_sections = "section" in df.columns and df["section"].notna().any()
+
+    if has_sections:
+        chips = "".join(
+            f'<span class="chip"><span class="dot" style="background:{section_color(s)}"></span>{s}</span>'
+            for s in sorted(df["section"].dropna().unique())
+        )
+
+        st.markdown(f'<div class="chip-row">{chips}</div>', unsafe_allow_html=True)
+
+        sections = ["All"] + sorted(df["section"].dropna().unique())
+        section_filter = st.selectbox("Filter by section", sections, label_visibility="collapsed")
+
+        filtered = df if section_filter == "All" else df[df["section"] == section_filter]
+    else:
+        filtered = df
+
+    cols = [
+        "ticker",
+        "current_ps",
+        "hist_median_ps",
+        "forward_ps",
+        "forward_revenue_growth",
+        "growth_gap",
+        "expectations_classification",
+    ]
+
+    if has_sections:
+        cols = ["ticker", "section", "layer", "portfolio_weight"] + cols[1:]
+
+    if "quality_flag" in filtered.columns:
+        cols.append("quality_flag")
+
+    view = filtered[[c for c in cols if c in filtered.columns]].copy()
+
+    if "forward_revenue_growth" in view.columns:
+        view["forward_revenue_growth"] = view["forward_revenue_growth"] * 100
+
+    if "growth_gap" in view.columns:
+        view["growth_gap"] = view["growth_gap"] * 100
+
+    if "portfolio_weight" in view.columns:
+        view["portfolio_weight"] = view["portfolio_weight"] * 100
+
+    rename_map = {
+        "section": "Section",
+        "layer": "Layer",
+        "portfolio_weight": "Target wt %",
+        "current_ps": "Current P/S",
+        "hist_median_ps": "Median P/S",
+        "forward_ps": "Forward P/S",
+        "forward_revenue_growth": "Fwd growth %",
+        "growth_gap": "Growth gap %",
+        "expectations_classification": "Expectations",
+        "quality_flag": "Fundamentals",
+    }
+
+    view = view.rename(columns=rename_map)
+
+    sort_options = [c for c in view.columns if c != "ticker"]
+    default_sort = "Growth gap %" if "Growth gap %" in sort_options else sort_options[0]
+
+    sort_col = st.selectbox("Sort by", sort_options, index=sort_options.index(default_sort))
+
+    view = view.sort_values(sort_col, ascending=sort_col in ("Ticker",))
+
+    column_config = {
+        "Current P/S": st.column_config.NumberColumn(format="%.2fx"),
+        "Median P/S": st.column_config.NumberColumn(format="%.2fx"),
+        "Forward P/S": st.column_config.NumberColumn(format="%.2fx"),
+        "Fwd growth %": st.column_config.NumberColumn(format="%.1f%%"),
+        "Growth gap %": st.column_config.NumberColumn(format="%+.1f%%"),
+    }
+
+    if "Target wt %" in view.columns:
+        max_wt = (
+            float(view["Target wt %"].max())
+            if not view.empty and pd.notna(view["Target wt %"].max())
+            else 1.0
+        )
+
+        column_config["Target wt %"] = st.column_config.ProgressColumn(
+            format="%.2f%%",
+            min_value=0,
+            max_value=max_wt,
+        )
+
+    st.dataframe(view, use_container_width=True, hide_index=True, column_config=column_config)
+
+
+with tab_overview:
+    render_watchlist_tab()
+
+
+# ---------------------------------------------------------------------------
+# Ticker detail tab
+# ---------------------------------------------------------------------------
+
+with tab_detail:
+    if df.empty:
+        st.caption("Nothing to show yet -- run the engine to populate the watchlist.")
+    else:
+        ticker = st.selectbox("Ticker", sorted(df["ticker"].unique()))
+        row = df[df["ticker"] == ticker].iloc[0]
+
+        render_ticker_detail(row, show_trend=True)
+
+
+# ---------------------------------------------------------------------------
+# Ad-hoc search tab
+# ---------------------------------------------------------------------------
+
+with tab_search:
+    st.caption(
+        "Look up any ticker outside your configured watchlist -- runs a live fetch "
+        "against Yahoo Finance (takes a few seconds), separate from the tracked data above."
+    )
+
+    col_a, col_b = st.columns([4, 1])
+
+    symbol_input = col_a.text_input(
+        "Ticker symbol",
+        placeholder="e.g. MSFT, RELIANCE.NS, 6758.T, BHP.AX",
+        label_visibility="collapsed",
+    )
+
+    lookup_clicked = col_b.button("Look up", use_container_width=True)
+
+    if lookup_clicked and symbol_input.strip():
+        symbol = symbol_input.strip().upper()
+
+        with st.spinner(f"Fetching live data for {symbol}..."):
+            try:
+                st.session_state["adhoc_result"] = fetch_adhoc(symbol)
+                st.session_state["adhoc_error"] = None
+            except Exception as exc:  # noqa: BLE001
+                st.session_state["adhoc_result"] = None
+                st.session_state["adhoc_error"] = f"Couldn't fetch {symbol}: {exc}"
+
+    if st.session_state.get("adhoc_error"):
+        st.error(st.session_state["adhoc_error"])
+
+    elif st.session_state.get("adhoc_result"):
+        render_ticker_detail(st.session_state["adhoc_result"], show_trend=False)
+
+    elif not lookup_clicked:
+        st.caption("Enter a ticker above and click Look up.")
