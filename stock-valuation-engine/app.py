@@ -753,18 +753,6 @@ if df.empty:
 # Summary strip
 # ---------------------------------------------------------------------------
 
-if not df.empty:
-    if "expectations_classification" in df.columns:
-        n_manageable = (df["expectations_classification"] == "Forward Expectations Manageable").sum()
-        n_elevated = (df["expectations_classification"] == "Forward Expectations Elevated").sum()
-        n_stretched = (df["expectations_classification"] == "Forward Expectations Stretched").sum()
-    else:
-        n_manageable = n_elevated = n_stretched = 0
-
-    avg_gap = None
-
-    if "growth_gap" in df.columns and df["growth_gap"].notna().any():
-        avg_gap = df["growth_gap"].dropna().mean() * 100
 
     if not df.empty:
     if "expectations_classification" in df.columns:
