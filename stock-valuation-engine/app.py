@@ -611,7 +611,7 @@ def render_ticker_detail(row, show_trend: bool = True):
             "quality. Estimate revision coverage is patchy outside large, well-covered names."
         )
 
-    # -----------------------------------------------------------------
+        # -----------------------------------------------------------------
     # Anti-bubble detector
     # -----------------------------------------------------------------
     st.markdown("##### Anti-bubble detector")
@@ -624,4 +624,34 @@ def render_ticker_detail(row, show_trend: bool = True):
         b1, b2, b3, b4 = st.columns(4)
 
         card(b1, "Market cap CAGR (3Y)", fmt_signed_pct(row.get("market_cap_cagr_3y")))
-        card(b2, "Revenue CAGR (3Y)", fmt_signed_pct(row.get
+        card(b2, "Revenue CAGR (3Y)", fmt_signed_pct(row.get("revenue_cagr_3y")))
+
+        gap = safe_float(row.get("multiple_expansion_gap_3y"))
+
+        if gap is not None:
+            if gap <= 0.05:
+                gap_color = "#4FBF7A"
+            elif gap <= 0.20:
+                gap_color = "#E0A63A"
+            else:
+                gap_color = "#E0584F"
+            gap_text = f"{gap * 100:+.1f}pp"
+        else:
+            gap_color = DEFAULT_ACCENT
+            gap_text = "n/a"
+
+        card(b3, "Multiple expansion gap", gap_text, color=gap_color)
+
+        bubble_flag = row.get("anti_bubble_flag", "Insufficient data")
+        if bubble_flag is None or pd.isna(bubble_flag):
+            bubble_flag = "Insufficient data"
+
+        card(b4, "Bubble read", bubble_flag, color=anti_bubble_color(bubble_flag))
+
+        if row.get("anti_bubble_note"):
+            st.caption(row["anti_bubble_note"])
+        else:
+            st.caption(
+                "Gap = 3-year market cap growth minus 3-year revenue growth. "
+                "Positive values mean multiple expansion."
+            )
