@@ -1,7 +1,8 @@
 """
-Valuation metrics engine.
-
-Pure computation layer.
+Valuation metrics engine -- pure computation layer.
+Includes owner-earnings pass-through, the anti-bubble detector, and a
+data-quality guard layer that neutralises/flags implausible yfinance inputs
+(units mismatches, broken histories, extreme analyst estimates).
 """
 
 from __future__ import annotations
@@ -39,7 +40,6 @@ class ValuationResult:
     valuation_anchor_observation_count: int
     revenue_data_cadence: str
 
-    # Fundamentals overlay
     gross_margin: float | None
     operating_margin: float | None
     net_margin: float | None
@@ -50,13 +50,11 @@ class ValuationResult:
     cash_conversion: float | None
     quality_flag: str
 
-    # Currency normalization metadata
     revenue_currency: str | None
     price_currency: str | None
     fx_rate_applied: float | None
     currency_note: str
 
-    # Growth durability, management, and risk overlay
     revenue_cagr_3y: float | None
     revenue_cagr_5y: float | None
     roic: float | None
@@ -71,13 +69,11 @@ class ValuationResult:
     eps_revisions_up_30d: int | None
     eps_revisions_down_30d: int | None
 
-    # Owner earnings overlay
     owner_earnings_ttm: float | None = None
     owner_earnings_yield: float | None = None
     maintenance_capex_ttm: float | None = None
     owner_earnings_method: str | None = None
 
-    # Anti-bubble / multiple expansion overlay
     price_cagr_3y: float | None = None
     market_cap_cagr_3y: float | None = None
     multiple_expansion_gap_3y: float | None = None
@@ -114,20 +110,13 @@ def _classify_expectations(burden_score: float | None) -> str:
 
 
 def _burden_score(required_growth: float, forward_growth: float) -> float:
-    """
-    0-100: how much of the growth implied by the current price is NOT
-    already covered by the forward estimate.
-    """
     if required_growth <= 0:
         return 0.0
-
     coverage = forward_growth / required_growth
-
     return float(np.clip(100 * (1 - min(coverage, 1)), 0, 100))
 
 
 def _plain_explanation(required_growth: float, forward_growth: float, classification: str) -> str:
-    """A one-line, non-technical readout."""
     req_pct = f"{required_growth * 100:.0f}%"
     fwd_pct = f"{forward_growth * 100:.0f}%"
 
@@ -136,68 +125,40 @@ def _plain_explanation(required_growth: float, forward_growth: float, classifica
             f"Already trades at or below its historical valuation norm (needs 0% growth) -- "
             f"{fwd_pct} forecast growth would be upside on top of an already-fair price."
         )
-
     if classification == "Forward Expectations Manageable":
         return (
             f"Needs {req_pct} growth to look fairly valued by its own history; analysts expect "
             f"{fwd_pct} -- the bar is comfortably cleared if the forecast is anywhere close to right."
         )
-
     if classification == "Forward Expectations Elevated":
         return (
             f"Needs {req_pct} growth to look fairly valued; analysts expect {fwd_pct} -- covers part "
             f"of what's required, but the price still leans on the forecast coming through."
         )
-
     return (
         f"Needs {req_pct} growth to look fairly valued by its own history, but analysts only expect "
         f"{fwd_pct} -- the price is asking for more growth than is currently forecast."
     )
 
 
-def _classify_quality(
-    operating_margin: float | None,
-    net_debt_to_ebitda: float | None,
-    fcf_margin: float | None,
-) -> str:
-    """
-    A simple, explainable read on whether the growth story sits on solid fundamentals.
-    """
+def _classify_quality(operating_margin, net_debt_to_ebitda, fcf_margin) -> str:
     if operating_margin is None and net_debt_to_ebitda is None and fcf_margin is None:
         return "Insufficient data"
-
     flags = []
-
     if operating_margin is not None and operating_margin < 0:
         flags.append("unprofitable")
-
     if net_debt_to_ebitda is not None and net_debt_to_ebitda > 3:
         flags.append("high leverage")
-
     if fcf_margin is not None and fcf_margin < 0:
         flags.append("cash burning")
-
     if not flags:
         return "Solid"
-
     if len(flags) == 1:
         return f"Watch: {flags[0]}"
-
     return f"Caution: {', '.join(flags)}"
 
 
-def _anti_bubble_read(
-    market_cap_cagr_3y: float | None,
-    revenue_cagr_3y: float | None,
-    current_ps: float,
-    hist_p75: float,
-    hist_p90: float,
-) -> tuple[float | None, str, str | None]:
-    """
-    Anti-bubble detector:
-
-        Multiple Expansion Gap = 3Y Market Cap CAGR - 3Y Revenue CAGR
-    """
+def _anti_bubble_read(market_cap_cagr_3y, revenue_cagr_3y, current_ps, hist_p75, hist_p90):
     if not _is_number(market_cap_cagr_3y) or not _is_number(revenue_cagr_3y):
         return None, "Insufficient data", None
 
@@ -213,42 +174,28 @@ def _anti_bubble_read(
         flag = "High multiple expansion risk"
 
     note = None
-
-    if (
-        gap > 0.30
-        and _is_number(current_ps)
-        and _is_number(hist_p90)
-        and current_ps > hist_p90
-    ):
-        note = (
-            "Market cap growth is far ahead of revenue growth while P/S is near historical highs -- "
-            "multiple expansion is doing most of the work."
-        )
-
-    elif (
-        gap > 0.20
-        and _is_number(current_ps)
-        and _is_number(hist_p75)
-        and current_ps > hist_p75
-    ):
-        note = (
-            "Market cap growth is outpacing revenue growth and the current multiple is above its "
-            "historical 75th percentile -- expansion risk is elevated."
-        )
-
+    if gap > 0.30 and _is_number(current_ps) and _is_number(hist_p90) and current_ps > hist_p90:
+        note = ("Market cap growth is far ahead of revenue growth while P/S is near historical highs -- "
+                "multiple expansion is doing most of the work.")
+    elif gap > 0.20 and _is_number(current_ps) and _is_number(hist_p75) and current_ps > hist_p75:
+        note = ("Market cap growth is outpacing revenue growth and the current multiple is above its "
+                "historical 75th percentile -- expansion risk is elevated.")
     elif gap > 0.20:
-        note = (
-            "Market cap growth is outpacing revenue growth, but the current multiple is not at an "
-            "extreme historical level."
-        )
-
+        note = ("Market cap growth is outpacing revenue growth, but the current multiple is not at an "
+                "extreme historical level.")
     elif gap > 0.05:
         note = "Market cap has grown somewhat faster than revenue over the last 3 years."
-
     else:
         note = "Market cap growth has not materially outpaced revenue growth over the last 3 years."
 
     return gap, flag, note
+
+
+# Guardrail constants
+PS_MIN, PS_MAX = 0.05, 100.0          # plausible P/S band for operating companies
+STRUCTURAL_RATIO = 3.0                # current vs median P/S break threshold
+FWD_RATIO_MIN, FWD_RATIO_MAX = 0.2, 5.0  # forward estimate vs TTM revenue sanity band
+FWD_GROWTH_CAP = 1.0                  # 100% cap for gap/burden math
 
 
 def compute_valuation(
@@ -291,21 +238,12 @@ def compute_valuation(
     price_cagr_3y: float | None = None,
     market_cap_cagr_3y: float | None = None,
 ) -> ValuationResult:
-    """
-    historical_ps_series:
-        pandas Series of historical trailing P/S observations.
-    """
     as_of = as_of or datetime.utcnow()
 
-    current_ps = (
-        current_market_cap / current_revenue_ttm
-        if current_revenue_ttm
-        else float("nan")
-    )
+    current_ps = current_market_cap / current_revenue_ttm if current_revenue_ttm else float("nan")
 
     clean = historical_ps_series.dropna() if historical_ps_series is not None else pd.Series(dtype=float)
     clean = clean[clean > 0]
-
     n_obs = len(clean)
 
     hist_median = float(clean.median()) if n_obs else float("nan")
@@ -320,51 +258,105 @@ def compute_valuation(
         if _is_number(target_multiple_value) and target_multiple_value > 0
         else float("nan")
     )
-
     required_growth = (
         (required_revenue / current_revenue_ttm) - 1
         if _is_number(required_revenue) and current_revenue_ttm
         else float("nan")
     )
 
+    # ------------------------------------------------------------------
+    # DATA-QUALITY GUARDS -- yfinance numbers are trusted only after
+    # passing simple plausibility checks. Failures never crash the row;
+    # they neutralise the affected input and/or add a visible warning.
+    # ------------------------------------------------------------------
+    sanity_notes: list[str] = []
+
+    # Guard 1: P/S outside any plausible band -> units/currency mismatch.
+    if _is_number(current_ps) and (current_ps < PS_MIN or current_ps > PS_MAX):
+        sanity_notes.append(
+            f"Current P/S {current_ps:.2f} is outside the plausible {PS_MIN}-{PS_MAX:.0f} band -- "
+            "likely a units/currency mismatch in the source data; treat all multiples with caution."
+        )
+
+    # Guard 2: current P/S far away from its own history -> structural break
+    # (ADR ratio change, share-count jump, FX break, broken history).
+    if (
+        n_obs >= 8
+        and _is_number(current_ps) and current_ps > 0
+        and _is_number(hist_median) and hist_median > 0
+    ):
+        ps_ratio = current_ps / hist_median
+        if ps_ratio > STRUCTURAL_RATIO or ps_ratio < 1.0 / STRUCTURAL_RATIO:
+            sanity_notes.append(
+                f"Current P/S is {ps_ratio:.1f}x its own historical median -- suspect structural break "
+                "(ADR/share ratio change, share-count jump, FX, or broken history); percentiles and "
+                "growth-gap are unreliable for this ticker."
+            )
+
+    # Guard 3: forward estimate in different units than reported revenue.
+    if forward_revenue_estimate and forward_revenue_estimate > 0 and current_revenue_ttm:
+        fwd_ratio = forward_revenue_estimate / current_revenue_ttm
+        if fwd_ratio < FWD_RATIO_MIN or fwd_ratio > FWD_RATIO_MAX:
+            sanity_notes.append(
+                f"Forward revenue estimate is {fwd_ratio:.1f}x TTM revenue (outside {FWD_RATIO_MIN}-"
+                f"{FWD_RATIO_MAX}x) -- units mismatch suspected; forward fields ignored."
+            )
+            forward_revenue_estimate = None
+
+    # Guard 4: honesty note when history is FX-converted at today's rate.
+    if fx_rate_applied is not None and fx_rate_applied != 1.0:
+        sanity_notes.append(
+            "Historical P/S converts all past periods at TODAY's FX rate -- percentiles are "
+            "approximate for foreign-currency reporters (material mainly for high-inflation currencies)."
+        )
+
+    # ------------------------------------------------------------------
+    # Forward block (with extreme-growth cap for gap/burden math)
+    # ------------------------------------------------------------------
     forward_growth = None
     forward_ps = None
     growth_gap = None
     years_to_normalise = None
     burden_score = None
 
-    if (
-        forward_revenue_estimate
-        and forward_revenue_estimate > 0
-        and _is_number(current_revenue_ttm)
-        and current_revenue_ttm > 0
-    ):
+    if (forward_revenue_estimate and forward_revenue_estimate > 0
+            and _is_number(current_revenue_ttm) and current_revenue_ttm > 0):
         forward_growth = (forward_revenue_estimate / current_revenue_ttm) - 1
         forward_ps = current_market_cap / forward_revenue_estimate
 
-        if _is_number(required_growth):
-            growth_gap = required_growth - forward_growth
+        growth_for_math = forward_growth
+        if forward_growth is not None and forward_growth > FWD_GROWTH_CAP:
+            growth_for_math = FWD_GROWTH_CAP
+            sanity_notes.append(
+                f"Analyst forward growth {forward_growth*100:.0f}% is extreme; capped at 100% for "
+                "growth-gap/burden math (displayed forward growth is unchanged)."
+            )
 
-            if forward_growth > 0:
-                years_to_normalise = np.log(required_revenue / current_revenue_ttm) / np.log(1 + forward_growth)
+        if _is_number(required_growth):
+            growth_gap = required_growth - growth_for_math
+
+            if growth_for_math > 0:
+                years_to_normalise = np.log(required_revenue / current_revenue_ttm) / np.log(1 + growth_for_math)
                 years_to_normalise = max(years_to_normalise, 0)
 
-            burden_score = _burden_score(required_growth, forward_growth)
+            burden_score = _burden_score(required_growth, growth_for_math)
 
     classification = _classify_expectations(burden_score)
 
     if not _is_number(required_growth):
-        explanation = (
-            "Not enough historical P/S observations to estimate required growth reliably -- "
-            "current P/S is shown as a low-confidence reference."
-        )
+        explanation = ("Not enough historical P/S observations to estimate required growth reliably -- "
+                       "current P/S is shown as a low-confidence reference.")
     elif forward_growth is None:
         explanation = (
-            f"No analyst forward revenue estimate available -- would need {required_growth*100:.0f}% "
-            f"growth to look fairly valued by its own history, but there's no forecast to check that against."
+            f"No usable analyst forward revenue estimate -- would need {required_growth*100:.0f}% "
+            f"growth to look fairly valued by its own history, but there's no reliable forecast to "
+            f"check that against."
         )
     else:
         explanation = _plain_explanation(required_growth, forward_growth, classification)
+
+    if sanity_notes:
+        explanation = "⚠ " + " ⚠ ".join(sanity_notes) + " " + explanation
 
     if currency_note and fx_rate_applied is None and revenue_currency and price_currency:
         explanation = f"⚠ {currency_note} {explanation}"
