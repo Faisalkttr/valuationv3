@@ -1,7 +1,4 @@
-"""
-Entry point run by GitHub Actions and locally.
-"""
-
+"""Entry point run by GitHub Actions (and locally: `python -m engine.run`)."""
 from __future__ import annotations
 
 import logging
@@ -32,22 +29,18 @@ def load_config() -> dict:
 
 def flatten_watchlist(config: dict) -> list[dict]:
     rows = []
-
     for section in config["sections"]:
         section_name = section["name"]
         section_target = section["target_pct"]
-
         for layer in section["layers"]:
             layer_name = layer["name"]
             layer_weight = layer["weight"]
             tickers = layer["tickers"]
-
             if tickers and isinstance(tickers[0], dict):
                 entries = [(t["ticker"], t["weight"]) for t in tickers]
             else:
                 even_share = 1 / len(tickers) if tickers else 0
                 entries = [(t, even_share) for t in tickers]
-
             for symbol, in_layer_weight in entries:
                 rows.append({
                     "symbol": symbol,
@@ -58,22 +51,18 @@ def flatten_watchlist(config: dict) -> list[dict]:
                     "portfolio_weight": section_target * layer_weight * in_layer_weight,
                     "thesis": layer.get("thesis", "").strip(),
                 })
-
     return rows
 
 
 def write_to_history_db(rows: list[dict]) -> None:
     DATA_DIR.mkdir(exist_ok=True)
-
     df = pd.DataFrame(rows)
-
     with sqlite3.connect(DB_PATH) as conn:
         df.to_sql("valuation_snapshots", conn, if_exists="append", index=False)
 
 
 def write_latest_csv(rows: list[dict]) -> None:
     DATA_DIR.mkdir(exist_ok=True)
-
     df = pd.DataFrame(rows)
     df.to_csv(LATEST_CSV_PATH, index=False)
 
@@ -85,11 +74,8 @@ def main() -> None:
 
     unique_symbols = list(dict.fromkeys(row["symbol"] for row in watchlist_rows))
 
-    log.info(
-        "Running valuation engine for %d tickers (%d watchlist entries)",
-        len(unique_symbols),
-        len(watchlist_rows),
-    )
+    log.info("Running valuation engine for %d tickers (%d watchlist entries)",
+             len(unique_symbols), len(watchlist_rows))
 
     fetched: dict = {}
     failures: list[str] = []
@@ -105,10 +91,8 @@ def main() -> None:
 
     for row in watchlist_rows:
         outcome = fetched.get(row["symbol"])
-
         if outcome is None:
             continue
-
         try:
             result = compute_valuation(
                 ticker=row["symbol"],
@@ -152,7 +136,6 @@ def main() -> None:
             )
 
             record = result.to_dict()
-
             record.update({
                 "section": row["section"],
                 "section_target_pct": row["section_target_pct"],
@@ -160,17 +143,11 @@ def main() -> None:
                 "portfolio_weight": row["portfolio_weight"],
                 "thesis": row["thesis"],
             })
-
             results.append(record)
 
-            log.info(
-                "%s: P/S %.2f vs median %.2f -- %s",
-                row["symbol"],
-                result.current_ps,
-                result.hist_median_ps,
-                result.expectations_classification,
-            )
-
+            log.info("%s: P/S %.2f vs median %.2f -- %s",
+                     row["symbol"], result.current_ps, result.hist_median_ps,
+                     result.expectations_classification)
         except Exception as exc:  # noqa: BLE001
             log.warning("Failed to compute metrics for %s: %s", row["symbol"], exc)
             failures.append(row["symbol"])
@@ -180,7 +157,6 @@ def main() -> None:
         write_latest_csv(results)
 
     log.info("Done. %d succeeded, %d failed.", len(results), len(failures))
-
     if failures:
         log.info("Failed tickers: %s", ", ".join(sorted(set(failures))))
 
