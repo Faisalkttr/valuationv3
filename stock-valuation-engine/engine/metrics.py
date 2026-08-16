@@ -141,11 +141,16 @@ def _plain_explanation(required_growth: float, forward_growth: float, classifica
     )
 
 
-def _classify_quality(operating_margin, net_debt_to_ebitda, fcf_margin) -> str:
-    if operating_margin is None and net_debt_to_ebitda is None and fcf_margin is None:
+def _classify_quality(operating_margin, net_debt_to_ebitda, fcf_margin, net_margin=None) -> str:
+    if (operating_margin is None and net_debt_to_ebitda is None
+            and fcf_margin is None and net_margin is None):
         return "Insufficient data"
+
     flags = []
+
     if operating_margin is not None and operating_margin < 0:
+        flags.append("unprofitable")
+    elif operating_margin is None and net_margin is not None and net_margin < 0:
         flags.append("unprofitable")
     if net_debt_to_ebitda is not None and net_debt_to_ebitda > 3:
         flags.append("high leverage")
