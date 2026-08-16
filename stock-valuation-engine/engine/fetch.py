@@ -577,13 +577,44 @@ def _fundamentals(tkr: yf.Ticker, revenue_ttm: float, cadence: str) -> dict:
     out: dict = {}
     ebitda = None
     net_income = None
+    da = None
+
     try:
         income = _income_statement_for_cadence(tkr, cadence)
+        cashflow = _cashflow_statement_for_cadence(tkr, cadence)
+
         gross_profit = _row_period_sum(income, cadence, "Gross Profit")
-        operating_income = _row_period_sum(income, cadence, "Operating Income", "EBIT")
+        operating_income = _row_period_sum(
+            income, cadence,
+            "Operating Income", "Operating Income (Loss)", "EBIT",
+            "Operating Earnings", "Pretax Income", "Profit Before Tax",
+        )
         net_income = _row_period_sum(income, cadence, "Net Income", "Net Income Common Stockholders")
         interest_expense = _row_period_sum(income, cadence, "Interest Expense", "Interest Expense Non Operating")
         ebitda = _row_period_sum(income, cadence, "EBITDA", "Normalized EBITDA")
+
+        # D&A, needed for the EBITDA fallback below
+        da = _row_period_sum(
+            cashflow, cadence,
+            "Depreciation And Amortization", "Depreciation & Amortization",
+            "Depreciation Amortization Depletion", "Depreciation, Amortization & Depletion", "D&A",
+        )
+        if da is None:
+            da = _row_period_sum(
+                income, cadence,
+                "Depreciation And Amortization", "Depreciation & Amortization",
+                "Depreciation Amortization Depletion", "Depreciation, Amortization & Depletion", "D&A",
+            )
+
+        # Fallback 1: EBITDA = Operating Income + D&A when Yahoo has no EBITDA row
+        # (this is the common case for foreign/ADR listings with partial statements)
+        if ebitda is None and operating_income is not None and da is not None:
+            ebitda = operating_income + da
+
+        # Fallback 2: Operating Income = EBITDA - D&A (reverse direction)
+        if operating_income is None and ebitda is not None and da is not None:
+            operating_income = ebitda - da
+
         if revenue_ttm:
             if gross_profit is not None:
                 out["gross_margin"] = gross_profit / revenue_ttm
@@ -591,10 +622,12 @@ def _fundamentals(tkr: yf.Ticker, revenue_ttm: float, cadence: str) -> dict:
                 out["operating_margin"] = operating_income / revenue_ttm
             if net_income is not None:
                 out["net_margin"] = net_income / revenue_ttm
+
         if operating_income is not None and interest_expense:
             out["interest_coverage"] = operating_income / abs(interest_expense)
     except Exception:
         log.debug("%s: income statement fundamentals unavailable", getattr(tkr, "ticker", "?"))
+
     try:
         balance = _balance_sheet_for_cadence(tkr, cadence)
         total_debt = _row_latest(balance, "Total Debt")
@@ -604,6 +637,7 @@ def _fundamentals(tkr: yf.Ticker, revenue_ttm: float, cadence: str) -> dict:
             out["net_debt_to_ebitda"] = (total_debt - cash) / ebitda
     except Exception:
         pass
+
     try:
         cashflow = _cashflow_statement_for_cadence(tkr, cadence)
         fcf = _row_period_sum(cashflow, cadence, "Free Cash Flow")
@@ -621,6 +655,7 @@ def _fundamentals(tkr: yf.Ticker, revenue_ttm: float, cadence: str) -> dict:
                 out["cash_conversion"] = fcf / net_income
     except Exception:
         pass
+
     return out
 
 
