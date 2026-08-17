@@ -2,15 +2,15 @@
 and 3Y market-cap growth inputs for the anti-bubble detector."""
 from __future__ import annotations
 
-import time
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 import pandas as pd
 import yfinance as yf
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from engine.metrics import PS_MIN, PS_MAX
+from engine.metrics import PS_MAX, PS_MIN
 
 log = logging.getLogger("engine.fetch")
 
@@ -64,13 +64,18 @@ def _safe_get(obj, key, default=None):
     try:
         getter = getattr(obj, "get", None)
         if callable(getter):
-            return getter(key, default)
+            val = getter(key, default)
+            if val is not None:
+                return val
     except Exception:
         pass
     try:
-        return getattr(obj, key, default)
+        val = getattr(obj, key, default)
+        if val is not None:
+            return val
     except Exception:
-        return default
+        pass
+    return default
 
 
 def _as_float(value):
@@ -97,16 +102,19 @@ def _first_float(values):
 
 
 def _get_metadata(tkr: yf.Ticker):
+    info = {}
     try:
-        info = tkr.info
+        fetched_info = tkr.info
+        if isinstance(fetched_info, dict):
+            info = fetched_info
     except Exception:
-        info = None
-    if info is None:
-        info = {}
+        pass
+
+    fast_info = None
     try:
         fast_info = tkr.fast_info
     except Exception:
-        fast_info = None
+        pass
     return info, fast_info
 
 
@@ -172,9 +180,9 @@ def _get_statement(tkr: yf.Ticker, attr_names: tuple[str, ...]) -> pd.DataFrame 
 def _statement_series(statement: pd.DataFrame | None, *row_names: str) -> pd.Series | None:
     if statement is None or getattr(statement, "empty", True):
         return None
-    row_lookup = {str(idx).strip(): idx for idx in statement.index}
+    row_lookup = {str(idx).strip().lower(): idx for idx in statement.index}
     for name in row_names:
-        actual_row = row_lookup.get(str(name).strip())
+        actual_row = row_lookup.get(str(name).strip().lower())
         if actual_row is None:
             continue
         raw = statement.loc[actual_row]
@@ -429,13 +437,6 @@ def _price_cagr(price_series: pd.Series | None, years: int = 3) -> float | None:
 
 
 def _income_statement_for_cadence(tkr, cadence):
-    """Returns (statement, actual_cadence). `actual_cadence` reflects which
-    statement was actually returned -- if the requested cadence is
-    "quarterly" but no quarterly income statement exists, this silently
-    falls back to the annual one, and callers MUST use the returned cadence
-    (not the requested one) for any period-sum math, or they'll sum 4x too
-    many periods and overstate TTM figures by ~4x.
-    """
     if cadence == "annual":
         return _get_statement(tkr, ("income_stmt", "financials")), "annual"
     stmt = _get_statement(tkr, ("quarterly_income_stmt", "quarterly_financials"))
@@ -445,7 +446,6 @@ def _income_statement_for_cadence(tkr, cadence):
 
 
 def _cashflow_statement_for_cadence(tkr, cadence):
-    """Returns (statement, actual_cadence) -- see _income_statement_for_cadence."""
     if cadence == "annual":
         return _get_statement(tkr, ("cashflow",)), "annual"
     stmt = _get_statement(tkr, ("quarterly_cashflow",))
@@ -487,10 +487,6 @@ def _roic_for_period(operating_income, pretax, tax, total_debt, equity, cash) ->
 
 
 def _roic(tkr: yf.Ticker) -> float | None:
-    """Latest-period ROIC snapshot. Kept for callers that only need a single
-    current figure; see `_roic_series` for the multi-year history used to
-    derive a persistence score.
-    """
     try:
         income = _get_statement(tkr, ("income_stmt", "financials"))
         balance = _get_statement(tkr, ("balance_sheet",))
@@ -507,10 +503,6 @@ def _roic(tkr: yf.Ticker) -> float | None:
 
 
 def _roic_series(tkr: yf.Ticker, max_periods: int = 4) -> pd.Series:
-    """Up to `max_periods` years of annual ROIC, oldest first, used to derive
-    a persistence score (level + trend) rather than trusting a single-year
-    snapshot -- a business can show a great ROIC in one lucky year.
-    """
     try:
         income = _get_statement(tkr, ("income_stmt", "financials"))
         balance = _get_statement(tkr, ("balance_sheet",))
@@ -654,7 +646,6 @@ def _fundamentals(tkr: yf.Ticker, revenue_ttm: float, cadence: str) -> dict:
         interest_expense = _row_period_sum(income, income_cadence, "Interest Expense", "Interest Expense Non Operating")
         ebitda = _row_period_sum(income, income_cadence, "EBITDA", "Normalized EBITDA")
 
-        # D&A, needed for the EBITDA fallback below
         da = _row_period_sum(
             cashflow, cashflow_cadence,
             "Depreciation And Amortization", "Depreciation & Amortization",
@@ -667,12 +658,9 @@ def _fundamentals(tkr: yf.Ticker, revenue_ttm: float, cadence: str) -> dict:
                 "Depreciation Amortization Depletion", "Depreciation, Amortization & Depletion", "D&A",
             )
 
-        # Fallback 1: EBITDA = Operating Income + D&A when Yahoo has no EBITDA row
-        # (this is the common case for foreign/ADR listings with partial statements)
         if ebitda is None and operating_income is not None and da is not None:
             ebitda = operating_income + da
 
-        # Fallback 2: Operating Income = EBITDA - D&A (reverse direction)
         if operating_income is None and ebitda is not None and da is not None:
             operating_income = ebitda - da
 
@@ -882,22 +870,6 @@ def fetch_ticker(symbol: str, history_years: int = 5) -> RawTickerData:
     if current_revenue_ttm is None or current_revenue_ttm <= 0:
         raise ValueError(f"{symbol}: no positive converted TTM-like revenue available")
 
-    # ------------------------------------------------------------------
-    # Currency-tag plausibility cross-check.
-    #
-    # Yahoo's `financialCurrency` metadata is frequently wrong for foreign
-    # ADRs -- it can claim a local currency (e.g. ARS) even when the
-    # underlying statement figures are already in the price currency (e.g.
-    # USD). Blindly applying an FX rate in that case silently divides a
-    # correct revenue figure by the FX rate for no reason (seen on YPF:
-    # $18.8B correctly-scaled USD revenue divided down to $12.6M because
-    # financialCurrency said "ARS" when the numbers were already USD).
-    #
-    # We can't ask Yahoo which one is right, but we CAN check which
-    # interpretation produces a plausible P/S multiple. If the unconverted
-    # (native) figure yields a sane P/S and the FX-converted one doesn't
-    # (or vice versa), prefer whichever one is plausible and say so.
-    # ------------------------------------------------------------------
     if fx_rate and fx_rate != 1.0:
         native_ps = market_cap / native_revenue_ttm
         converted_ps = market_cap / current_revenue_ttm
@@ -924,12 +896,6 @@ def fetch_ticker(symbol: str, history_years: int = 5) -> RawTickerData:
         hist_ps = pd.Series([current_ps], index=[pd.Timestamp.today()])
         price_series = _fallback_price_series(tkr, years=history_years)
 
-    # `price_series` above can be truncated to the revenue-statement window
-
-    # (yfinance quarterly financials often only go back ~4-5 quarters, well
-    # short of `history_years`). The anti-bubble 3Y market-cap CAGR needs a
-    # genuinely long price history independent of that window, so fetch one
-    # separately rather than reusing the (possibly short) series above.
     cagr_price_series = _fallback_price_series(tkr, years=history_years)
     if cagr_price_series is None or cagr_price_series.empty:
         cagr_price_series = price_series
