@@ -287,12 +287,47 @@ def _cagr(series: pd.Series | None, years: int) -> float | None:
     return (end / start) ** (1 / years) - 1
 
 
-def _historical_ps_series(tkr, rev_series, years, shares=None, cadence="quarterly"):
+def _shares_lookup_from_series(shares_series: pd.Series | None) -> pd.Series | None:
+    """Clean a raw shares-outstanding series into a sorted, tz-naive,
+    positive-only lookup usable for as-of matching. Returns None if there's
+    nothing usable, so callers can fall back to a constant share count."""
+    if shares_series is None or shares_series.empty:
+        return None
+    s = shares_series.dropna()
+    s = s[s > 0]
+    if s.empty:
+        return None
+    try:
+        s = s.copy()
+        s.index = pd.to_datetime(s.index)
+        if getattr(s.index, "tz", None) is not None:
+            s.index = s.index.tz_localize(None)
+        return s.sort_index()
+    except Exception:
+        return None
+
+
+def _shares_as_of(shares_lookup: pd.Series | None, period_end, fallback: float | None) -> float | None:
+    """Share count as of a given date: most recent report at/before that
+    date; if the date predates every report on file, use the earliest known
+    count (still far better than assuming today's count); otherwise fall
+    back to the constant value."""
+    if shares_lookup is not None and not shares_lookup.empty:
+        prior = shares_lookup[shares_lookup.index <= period_end]
+        if not prior.empty:
+            return float(prior.iloc[-1])
+        return float(shares_lookup.iloc[0])
+    return fallback
+
+
+def _historical_ps_series(tkr, rev_series, years, shares=None, cadence="quarterly", shares_series=None):
     if shares is None:
         _, _, shares = _market_data(tkr)
     shares = _as_float(shares)
     if not shares:
         raise ValueError("No shares outstanding data available")
+
+    shares_lookup = _shares_lookup_from_series(shares_series)
 
     periods = _periods_for_cadence(cadence)
     if periods > 1:
@@ -351,7 +386,10 @@ def _historical_ps_series(tkr, rev_series, years, shares=None, cadence="quarterl
         price = _as_float(window.iloc[-1])
         if price is None:
             continue
-        ps_points.append((period_end, (price * shares) / ttm_rev))
+        shares_then = _shares_as_of(shares_lookup, period_end, shares)
+        if not shares_then:
+            continue
+        ps_points.append((period_end, (price * shares_then) / ttm_rev))
 
     if not ps_points:
         raise ValueError("No historical P/S observations could be constructed")
@@ -460,6 +498,49 @@ def _balance_sheet_for_cadence(tkr, cadence):
     return _get_statement(tkr, ("quarterly_balance_sheet",)) or _get_statement(tkr, ("balance_sheet",))
 
 
+_DEBT_TOTAL_CANDIDATES = ("Total Debt",)
+_DEBT_LONG_TERM_CANDIDATES = (
+    "Long Term Debt", "Long Term Debt And Capital Lease Obligation", "Long Term Debt Noncurrent",
+)
+_DEBT_CURRENT_CANDIDATES = (
+    "Current Debt", "Current Debt And Capital Lease Obligation", "Short Long Term Debt",
+    "Current Debt And Capital Lease Obligations",
+)
+
+
+def _total_debt_latest(balance) -> float | None:
+    """Total debt as of the latest period. Tries the direct 'Total Debt'
+    aggregate row first; if that's absent (common for smaller-cap and
+    non-US listings), falls back to summing long-term + current debt
+    components, since at least one of those is almost always present."""
+    direct = _as_float(_row_latest(balance, *_DEBT_TOTAL_CANDIDATES))
+    if direct is not None:
+        return direct
+    lt = _as_float(_row_latest(balance, *_DEBT_LONG_TERM_CANDIDATES))
+    st = _as_float(_row_latest(balance, *_DEBT_CURRENT_CANDIDATES))
+    if lt is None and st is None:
+        return None
+    return (lt or 0.0) + (st or 0.0)
+
+
+def _total_debt_series(balance) -> pd.Series | None:
+    """Same fallback as _total_debt_latest, but as a period-indexed series
+    for use where a full history is needed (e.g. per-period ROIC)."""
+    direct = _statement_series(balance, *_DEBT_TOTAL_CANDIDATES)
+    if direct is not None and not direct.empty:
+        return direct
+    lt = _statement_series(balance, *_DEBT_LONG_TERM_CANDIDATES)
+    st = _statement_series(balance, *_DEBT_CURRENT_CANDIDATES)
+    lt_empty = lt is None or lt.empty
+    st_empty = st is None or st.empty
+    if lt_empty and st_empty:
+        return None
+    lt = lt if not lt_empty else pd.Series(dtype=float)
+    st = st if not st_empty else pd.Series(dtype=float)
+    combined = lt.add(st, fill_value=0.0)
+    return combined if not combined.empty else None
+
+
 def _growth_durability(tkr: yf.Ticker) -> dict:
     out: dict = {}
     try:
@@ -493,7 +574,7 @@ def _roic(tkr: yf.Ticker) -> float | None:
         operating_income = _as_float(_row_latest(income, "Operating Income", "EBIT"))
         pretax = _as_float(_row_latest(income, "Pretax Income"))
         tax = _as_float(_row_latest(income, "Tax Provision"))
-        total_debt = _as_float(_row_latest(balance, "Total Debt"))
+        total_debt = _as_float(_total_debt_latest(balance))
         equity = _as_float(_row_latest(balance, "Stockholders Equity", "Common Stock Equity"))
         cash = _as_float(_row_latest(balance, "Cash And Cash Equivalents",
                                      "Cash Cash Equivalents And Short Term Investments"))
@@ -513,7 +594,7 @@ def _roic_series(tkr: yf.Ticker, max_periods: int = 4) -> pd.Series:
 
         pretax_s = _statement_series(income, "Pretax Income")
         tax_s = _statement_series(income, "Tax Provision")
-        debt_s = _statement_series(balance, "Total Debt")
+        debt_s = _total_debt_series(balance)
         equity_s = _statement_series(balance, "Stockholders Equity", "Common Stock Equity")
         cash_s = _statement_series(balance, "Cash And Cash Equivalents",
                                    "Cash Cash Equivalents And Short Term Investments")
@@ -536,11 +617,32 @@ def _roic_series(tkr: yf.Ticker, max_periods: int = 4) -> pd.Series:
         return pd.Series(dtype=float)
 
 
-def _share_dilution(tkr: yf.Ticker) -> float | None:
+_SHARES_ROW_CANDIDATES = (
+    "Ordinary Shares Number", "Share Issued", "Shares Issued",
+    "Common Shares Outstanding", "Number of Shares Outstanding",
+)
+
+
+def _shares_outstanding_series(tkr: yf.Ticker) -> pd.Series:
+    """Historical shares-outstanding series from the balance sheet, one point
+    per reported period end. Used so historical P/S reflects the share count
+    that actually existed at each point in time rather than today's count --
+    using a constant current share count for every past period understates
+    market cap (and therefore P/S) at every past date for a buyback-heavy
+    company, and overstates it for a diluting one, biasing the whole
+    historical percentile distribution the anchor is built from.
+    """
     try:
         balance = _get_statement(tkr, ("balance_sheet",))
-        shares = _row_series(balance, "Ordinary Shares Number", "Share Issued", "Shares Issued",
-                             "Common Shares Outstanding", "Number of Shares Outstanding")
+        series = _row_series(balance, *_SHARES_ROW_CANDIDATES)
+        return series if series is not None else pd.Series(dtype=float)
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def _share_dilution(tkr: yf.Ticker) -> float | None:
+    try:
+        shares = _shares_outstanding_series(tkr)
         return _cagr(shares, 3)
     except Exception:
         return None
@@ -679,7 +781,7 @@ def _fundamentals(tkr: yf.Ticker, revenue_ttm: float, cadence: str) -> dict:
 
     try:
         balance = _balance_sheet_for_cadence(tkr, cadence)
-        total_debt = _row_latest(balance, "Total Debt")
+        total_debt = _total_debt_latest(balance)
         cash = _row_latest(balance, "Cash And Cash Equivalents",
                            "Cash Cash Equivalents And Short Term Investments")
         if total_debt is not None and cash is not None and ebitda:
@@ -746,6 +848,21 @@ def _period_return(price_series: pd.Series, months: int) -> float | None:
         return None
 
 
+_benchmark_history_cache: dict[str, pd.Series] = {}
+
+
+def _benchmark_price_history(bm_symbol: str) -> pd.Series:
+    if bm_symbol in _benchmark_history_cache:
+        return _benchmark_history_cache[bm_symbol]
+    try:
+        hist = _get_ticker(bm_symbol).history(period="7mo")["Close"]
+    except Exception:
+        log.debug("benchmark %s: price history unavailable", bm_symbol)
+        hist = pd.Series(dtype=float)
+    _benchmark_history_cache[bm_symbol] = hist
+    return hist
+
+
 def _relative_strength(tkr, symbol, price_series=None) -> dict:
     out: dict = {}
     try:
@@ -759,13 +876,13 @@ def _relative_strength(tkr, symbol, price_series=None) -> dict:
         out["price_return_6m"] = stock_return
         bm_symbol = _benchmark_for(symbol)
         out["benchmark_symbol"] = bm_symbol
-        bm_hist = _get_ticker(bm_symbol).history(period="7mo")["Close"]
+        bm_hist = _benchmark_price_history(bm_symbol)
         bm_return = _period_return(bm_hist, 6)
         if bm_return is not None:
             out["benchmark_return_6m"] = bm_return
             out["relative_strength_6m"] = stock_return - bm_return
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("%s: relative strength unavailable (%s)", symbol, exc)
     return out
 
 
@@ -887,9 +1004,12 @@ def fetch_ticker(symbol: str, history_years: int = 5) -> RawTickerData:
             )
             fx_rate = None
 
+    shares_series = _shares_outstanding_series(tkr)
+
     try:
         hist_ps, price_series = _historical_ps_series(
             tkr, ps_rev_series, years=history_years, shares=shares, cadence=revenue_cadence,
+            shares_series=shares_series,
         )
     except Exception:
         current_ps = market_cap / current_revenue_ttm
